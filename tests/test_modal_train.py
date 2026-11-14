@@ -35,3 +35,14 @@ def test_run_summary_without_metrics(tmp_path):
     _nb(tmp_path / "ex.ipynb", [("model.train()", 3.0)])
     s = modal_train.run_summary(tmp_path / "ex.ipynb", tmp_path)
     assert s["epochs"] == 0 and "s_per_epoch" not in s and s["best"] == {} and s["keypoint_mode"] is None
+
+
+def test_usage_stats_only_counts_training_samples():
+    rows = [{"cores": 0.1, "gpu_util": 0.0, "gpu_mem_mib": 0.0},  # before the model is on the GPU
+            {"cores": 1.0, "gpu_util": 90.0, "gpu_mem_mib": 5000.0},
+            {"cores": 2.0, "gpu_util": 50.0, "gpu_mem_mib": 6000.0},
+            {"cores": 3.0, "gpu_util": 100.0, "gpu_mem_mib": 5500.0}]
+    s = modal_train.usage_stats(rows)
+    assert s == {"samples": 4, "busy_samples": 3, "cores_mean": 2.0, "cores_median": 2.0,
+                 "gpu_util_mean": 80.0, "gpu_util_median": 90.0, "gpu_mem_max_mib": 6000.0}
+    assert modal_train.usage_stats([]) == {"samples": 0}

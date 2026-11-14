@@ -1,6 +1,6 @@
-"""Modal launcher for the v3 training notebooks (paid training, Game Bot Creator's own account).
+"""Modal launcher for the v4 training notebooks (paid training, Game Bot Creator's own account).
 
-Runs train_object_detector{,_seg}_v3.ipynb unchanged through papermill on a Modal GPU in the EU,
+Runs train_object_detector{,_seg}_v4.ipynb unchanged through papermill on a Modal GPU in the EU,
 with the notebook's parameters pointed at a per-job folder on the `gbc-training` Volume:
 
     /vol/jobs/<job_id>/dataset/      dataset .zip (uploaded by the caller), or a shared
@@ -30,8 +30,8 @@ import modal
 
 HERE = Path(__file__).resolve().parent
 NOTEBOOKS = {
-    "rfdetr": "train_object_detector_v3.ipynb",
-    "rfdetr_seg": "train_object_detector_seg_v3.ipynb",
+    "rfdetr": "train_object_detector_v4.ipynb",
+    "rfdetr_seg": "train_object_detector_seg_v4.ipynb",
 }
 VOL = "/vol"
 # Fallback list: first type with capacity wins. Cheapest per unit of work first (2026-11-14 bench:
@@ -165,11 +165,13 @@ def usage_stats(rows: list[dict]) -> dict:
 
 
 @app.function(gpu=GPU, region=REGION, timeout=TIMEOUT_S, volumes={VOL: volume})
-def train(job_id: str, model_choice: str = "rfdetr", dataset_dir: str = "", num_workers: int = -1) -> dict:
+def train(job_id: str, model_choice: str = "rfdetr", dataset_dir: str = "", num_workers: int = -1,
+          max_epochs: int = 0) -> dict:
     """Runs the notebook for `model_choice` on job `job_id`. `dataset_dir` (Volume-relative,
     e.g. "datasets/x") replaces the job's own dataset/ folder. Returns {"onnx": Volume path
     of best.onnx, "summary": run_summary() + gpu, wall time, train image count, usage}.
-    `num_workers` >= 0 sets the notebook's DataLoader workers (-1 = notebook default)."""
+    `num_workers` >= 0 sets the notebook's DataLoader workers (-1 = notebook default);
+    `max_epochs` > 0 caps the epochs (0 = notebook default, 200)."""
     import subprocess
 
     import papermill as pm
@@ -190,6 +192,8 @@ def train(job_id: str, model_choice: str = "rfdetr", dataset_dir: str = "", num_
               "CHECKPOINT_DIR": paths["checkpoints"]}
     if num_workers >= 0:
         params["NUM_WORKERS"] = num_workers
+    if max_epochs > 0:
+        params["MAX_EPOCHS"] = max_epochs
     sampler = UsageSampler().start()
     pm.execute_notebook(
         f"/notebooks/{NOTEBOOKS[model_choice]}", executed,
@@ -201,6 +205,7 @@ def train(job_id: str, model_choice: str = "rfdetr", dataset_dir: str = "", num_
     summary["usage"] = usage
     summary["cpu_request"] = os.environ.get("MODAL_CPU_REQUEST", "")
     summary["num_workers"] = num_workers
+    summary["max_epochs"] = max_epochs
     summary["host_cpus"] = os.cpu_count()
     summary["gpu"] = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
                                     capture_output=True, text=True).stdout.strip()
@@ -247,7 +252,8 @@ def main(dataset: str, model: str = "rfdetr", job_id: str = "", out: str = "", g
 
 @app.local_entrypoint()
 def bench(out: str, datasets: str = "poe_mhb_20261103,goblins_20260914", models: str = "rfdetr,rfdetr_seg",
-          gpus: str = "T4,L4,A10", tag: str = "", max_wait_h: float = 4.0, cpu_variants: str = ""):
+          gpus: str = "T4,L4,A10", tag: str = "", max_wait_h: float = 4.0, cpu_variants: str = "",
+          max_epochs: int = 0):
     """Timing runs for the price table: every dataset x model x GPU (one GPU type each, no
     fallback), all spawned at once (Starter = 10 GPUs; the rest queue). Datasets must already
     be on the Volume under datasets/<name>/. Results are written to `out` as they come in;
@@ -265,7 +271,7 @@ def bench(out: str, datasets: str = "poe_mhb_20261103,goblins_20260914", models:
                         cores, workers = v.split(":")
                         opts["cpu"], workers, suffix = float(cores), int(workers), f"-cpu{cores}w{workers}"
                     job = f"bench-{tag}-{ds}-{m}-{g}{suffix}".lower()
-                    fc = train.with_options(**opts).spawn(job, m, f"datasets/{ds}", workers)
+                    fc = train.with_options(**opts).spawn(job, m, f"datasets/{ds}", workers, max_epochs)
                     calls.append(({"dataset": ds, "model": m, "gpu": g, "variant": v, "job_id": job,
                                    "call_id": fc.object_id}, fc))
                 print(f"spawned {job} ({fc.object_id})")

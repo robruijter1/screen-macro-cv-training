@@ -1,23 +1,28 @@
-"""Modal launcher for the v2 training notebooks (paid training, Game Bot Creator's own account).
+"""Modal launcher for the v3 training notebooks (paid training, Game Bot Creator's own account).
 
-Runs train_object_detector{,_seg}_v2.ipynb unchanged through papermill on a Modal GPU, with
-the notebook's parameters pointed at a per-job folder on the `gbc-training` Volume:
+Runs train_object_detector{,_seg}_v3.ipynb unchanged through papermill on a Modal GPU in the EU,
+with the notebook's parameters pointed at a per-job folder on the `gbc-training` Volume:
 
-    /vol/jobs/<job_id>/dataset/      dataset .zip (uploaded by the caller)
-    /vol/jobs/<job_id>/checkpoints/  rfdetr last.ckpt + best checkpoints (resume)
-    /vol/jobs/<job_id>/output/       best.onnx + executed.ipynb (full log)
+    /vol/jobs/<job_id>/dataset/      dataset .zip (uploaded by the caller), or a shared
+                                     /vol/datasets/<name>/ folder passed as dataset_dir
+    /vol/jobs/<job_id>/checkpoints/  rfdetr last.ckpt + best checkpoints + metrics.csv (resume)
+    /vol/jobs/<job_id>/output/       best.onnx + executed.ipynb (full log) + run_summary.json
 
 GPU functions on Modal are always preemptible; a preempted run restarts on the same input
 (same job_id) and the notebook resumes from checkpoints/last.ckpt. Volumes commit in the
 background every few seconds, plus once on shutdown.
 
-Test from a dev PC (needs `modal token new` once):
-    .venv-modal\\Scripts\\modal run modal_train.py --dataset path\\to\\x_dataset.zip [--model rfdetr_seg] [--job-id ID]
+Dev PC (needs `modal token new` once):
+    .venv-modal\\Scripts\\modal run modal_train.py --dataset path\\to\\x_dataset.zip [--model rfdetr_seg] [--job-id ID] [--gpu T4]
+    .venv-modal\\Scripts\\modal run modal_train.py::bench --out results.json   (timing runs, see bench())
 Re-running with the same --job-id resumes that job. Later, the gateway calls `train.spawn()`.
 """
 from __future__ import annotations
 
+import csv
+import json
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -25,13 +30,14 @@ import modal
 
 HERE = Path(__file__).resolve().parent
 NOTEBOOKS = {
-    "rfdetr": "train_object_detector_v2.ipynb",
-    "rfdetr_seg": "train_object_detector_seg_v2.ipynb",
+    "rfdetr": "train_object_detector_v3.ipynb",
+    "rfdetr_seg": "train_object_detector_seg_v3.ipynb",
 }
 VOL = "/vol"
-# Fallback list: first type with capacity wins (L4 sat unscheduled for 30+ min on 2026-11-03).
-# GBC_TRAIN_GPU="T4" (comma-separated) overrides. GPUs need a payment method on the account.
-GPU = os.environ.get("GBC_TRAIN_GPU", "L4,A10,T4").split(",")
+# Fallback list: first type with capacity wins. Cheapest per unit of work first (2026-11-14 bench:
+# T4 costs 2-3x A10/L4 for box+kp). GBC_TRAIN_GPU="T4" (comma-separated) overrides; --gpu per call.
+GPU = os.environ.get("GBC_TRAIN_GPU", "A10,L4,T4").split(",")
+REGION = os.environ.get("GBC_TRAIN_REGION", "eu")  # all our services are EU; 1.15x price
 TIMEOUT_S = 6 * 3600  # Modal default is 5 min; max 24 h
 
 image = (
@@ -55,38 +61,82 @@ def job_paths(job_id: str, root: str = VOL) -> dict[str, str]:
     return {"dataset": f"{base}/dataset", "checkpoints": f"{base}/checkpoints", "output": f"{base}/output"}
 
 
-@app.function(gpu=GPU, timeout=TIMEOUT_S, volumes={VOL: volume})
-def train(job_id: str, model_choice: str = "rfdetr") -> str:
-    """Runs the notebook for `model_choice` on job `job_id`; returns best.onnx's Volume path."""
+def run_summary(executed_nb: Path, checkpoint_dir: Path) -> dict:
+    """Timing + scores of one finished run: papermill cell durations, epochs and best val
+    mAPs from rfdetr's metrics.csv. Pure (files only) so it is testable offline."""
+    nb = json.loads(Path(executed_nb).read_text(encoding="utf-8"))
+    cells = [c for c in nb["cells"] if c["cell_type"] == "code"]
+    durs = [float((c.get("metadata", {}).get("papermill") or {}).get("duration") or 0) for c in cells]
+    train_s = sum(d for c, d in zip(cells, durs) if "model.train(" in "".join(c["source"]))
+    out = {"total_cells_s": round(sum(durs), 1), "train_s": round(train_s, 1),
+           "epochs": 0, "best": {}, "keypoint_mode": None}
+    state = Path(checkpoint_dir) / "run_state.json"  # which model actually trained
+    if state.exists():
+        out["keypoint_mode"] = json.loads(state.read_text()).get("keypoint_mode")
+    metrics = Path(checkpoint_dir) / "metrics.csv"
+    if metrics.exists():
+        with open(metrics, newline="") as f:
+            rows = list(csv.DictReader(f))
+        epochs = {int(float(r["epoch"])) for r in rows if r.get("epoch") not in (None, "")}
+        out["epochs"] = (max(epochs) + 1) if epochs else 0
+        for r in rows:
+            for k, v in r.items():
+                if not (k and k.startswith("val/") and "mAP" in k and v not in (None, "")):
+                    continue
+                v = float(v)
+                if k not in out["best"] or v > out["best"][k]["value"]:
+                    out["best"][k] = {"value": round(v, 4), "epoch": int(float(r.get("epoch") or 0))}
+    if out["epochs"]:
+        out["s_per_epoch"] = round(train_s / out["epochs"], 2)
+    return out
+
+
+@app.function(gpu=GPU, region=REGION, timeout=TIMEOUT_S, volumes={VOL: volume})
+def train(job_id: str, model_choice: str = "rfdetr", dataset_dir: str = "") -> dict:
+    """Runs the notebook for `model_choice` on job `job_id`. `dataset_dir` (Volume-relative,
+    e.g. "datasets/x") replaces the job's own dataset/ folder. Returns {"onnx": Volume path
+    of best.onnx, "summary": run_summary() + gpu, wall time, train image count}."""
+    import subprocess
+
     import papermill as pm
 
+    t0 = time.time()
     if model_choice not in NOTEBOOKS:
         raise ValueError(f"unknown model_choice {model_choice!r}")
     paths = job_paths(job_id)
+    if dataset_dir:
+        paths["dataset"] = f"{VOL}/{dataset_dir.strip('/')}"
     for key in ("checkpoints", "output"):
         Path(paths[key]).mkdir(parents=True, exist_ok=True)
     work = Path("/tmp/work")
     work.mkdir(parents=True, exist_ok=True)
     os.chdir(work)  # dataset_raw/, dataset_coco/ etc. stay off the Volume
+    executed = f"{paths['output']}/executed.ipynb"
     pm.execute_notebook(
-        f"/notebooks/{NOTEBOOKS[model_choice]}",
-        f"{paths['output']}/executed.ipynb",
+        f"/notebooks/{NOTEBOOKS[model_choice]}", executed,
         parameters={"DATASET_DIR": paths["dataset"], "OUTPUT_DIR": paths["output"],
                     "CHECKPOINT_DIR": paths["checkpoints"]},
         kernel_name="python3", cwd=str(work), log_output=True,
     )
+    summary = run_summary(Path(executed), Path(paths["checkpoints"]))
+    summary["gpu"] = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                                    capture_output=True, text=True).stdout.strip()
+    summary["region"] = os.environ.get("MODAL_REGION", "")
+    summary["wall_s"] = round(time.time() - t0, 1)
+    coco = work / "dataset_coco"
+    summary["images"] = {s: len(json.loads((coco / s / "_annotations.coco.json").read_text())["images"])
+                         for s in ("train", "valid") if (coco / s / "_annotations.coco.json").exists()}
+    Path(paths["output"], "run_summary.json").write_text(json.dumps(summary, indent=1))
     volume.commit()
     onnx = Path(paths["output"]) / "best.onnx"
     if not onnx.exists():
         raise RuntimeError("notebook finished without best.onnx")
-    return str(onnx.relative_to(VOL))
+    return {"onnx": str(onnx.relative_to(VOL)), "summary": summary}
 
 
 @app.local_entrypoint()
-def main(dataset: str, model: str = "rfdetr", job_id: str = "", out: str = ""):
+def main(dataset: str, model: str = "rfdetr", job_id: str = "", out: str = "", gpu: str = ""):
     """Dev test: upload `dataset` zip, train, download best.onnx next to the zip (or to `out`)."""
-    import time
-
     job_id = job_id or f"test-{uuid.uuid4().hex[:8]}"
     remote_dir = job_paths(job_id, root="")["dataset"]
     try:
@@ -102,10 +152,42 @@ def main(dataset: str, model: str = "rfdetr", job_id: str = "", out: str = ""):
         print(f"uploaded dataset in {(time.time() - t_up) / 60:.1f} min")
     print(f"job_id={job_id} (re-run with --job-id {job_id} to resume)")
     t0 = time.time()
-    onnx_rel = train.remote(job_id, model)
-    print(f"train finished in {(time.time() - t0) / 60:.1f} min")
+    fn = train.with_options(gpu=gpu.split(",")) if gpu else train
+    res = fn.remote(job_id, model)
+    print(f"train finished in {(time.time() - t0) / 60:.1f} min: {json.dumps(res['summary'])}")
     dest = Path(out) if out else Path(dataset).with_name(f"{Path(dataset).stem}_modal.onnx")
     with open(dest, "wb") as f:
-        for chunk in volume.read_file(onnx_rel):
+        for chunk in volume.read_file(res["onnx"]):
             f.write(chunk)
-    print(f"downloaded {onnx_rel} -> {dest}")
+    print(f"downloaded {res['onnx']} -> {dest}")
+
+
+@app.local_entrypoint()
+def bench(out: str, datasets: str = "poe_mhb_20261103,goblins_20260914", models: str = "rfdetr,rfdetr_seg",
+          gpus: str = "T4,L4,A10", tag: str = "", max_wait_h: float = 4.0):
+    """Timing runs for the price table: every dataset x model x GPU (one GPU type each, no
+    fallback), all spawned at once (Starter = 10 GPUs; the rest queue). Datasets must already
+    be on the Volume under datasets/<name>/. Results are written to `out` as they come in;
+    calls still unfinished after `max_wait_h` are cancelled and recorded as such."""
+    tag = tag or time.strftime("%Y%m%d-%H%M")
+    calls = []
+    for ds in datasets.split(","):
+        for m in models.split(","):
+            for g in gpus.split(","):
+                job = f"bench-{tag}-{ds}-{m}-{g}".lower()
+                fc = train.with_options(gpu=g).spawn(job, m, f"datasets/{ds}")
+                calls.append(({"dataset": ds, "model": m, "gpu": g, "job_id": job, "call_id": fc.object_id}, fc))
+                print(f"spawned {job} ({fc.object_id})")
+    deadline = time.time() + max_wait_h * 3600
+    results = []
+    for meta, fc in calls:
+        try:
+            meta = {**meta, **fc.get(timeout=max(1.0, deadline - time.time()))}
+        except (TimeoutError, modal.exception.TimeoutError):
+            fc.cancel()
+            meta["error"] = f"not finished after {max_wait_h} h -- cancelled"
+        except Exception as exc:  # noqa: BLE001 -- record and keep collecting the others
+            meta["error"] = f"{type(exc).__name__}: {exc}"
+        results.append(meta)
+        Path(out).write_text(json.dumps(results, indent=1))
+        print(json.dumps(meta))

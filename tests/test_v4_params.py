@@ -1,14 +1,18 @@
 """v4 notebooks: MAX_EPOCHS + AMP_DTYPE parameters reach model.train(); fp16 on GPUs without
 real bf16 (T4: torch says bf16 is "supported" only through emulation). Runs the real cells with
 a fake rfdetr + fake torch (no GPU). Reuses test_v2_resume's helpers."""
+import json
 import sys
 import types
+import zipfile
 
 import pytest
 
 from test_v2_resume import FakeModel, _cell, env  # noqa: F401 -- env is a fixture
 
 NOTEBOOKS = ["train_object_detector_v4.ipynb", "train_object_detector_seg_v4.ipynb"]
+BOX_NB = NOTEBOOKS[0]
+BUILT = []
 
 
 def _fake_torch(monkeypatch, cuda=True, native_bf16=False):
@@ -23,6 +27,22 @@ def _fake_torch(monkeypatch, cuda=True, native_bf16=False):
     training.build_trainer = lambda *a, **k: types.SimpleNamespace(callbacks=[])
     monkeypatch.setitem(sys.modules, "rfdetr.training", training)
     sys.modules["rfdetr"].training = training
+    # v4 MODEL_SIZE / RESOLUTION: constructors take kwargs, model.model.resolution exists
+    defaults = {"keypoint": 576, "box": 384, "small": 512, "medium": 576}
+
+    def make(kind):
+        def ctor(**kw):
+            m = FakeModel(kind)
+            m.kw = kw
+            m.model = types.SimpleNamespace(resolution=kw.get("resolution", defaults[kind]))
+            BUILT.append(m)
+            return m
+        return ctor
+
+    BUILT.clear()
+    fake = sys.modules["rfdetr"]
+    fake.RFDETRKeypointPreview, fake.RFDETRNano = make("keypoint"), make("box")
+    fake.RFDETRSmall, fake.RFDETRMedium = make("small"), make("medium")
 
 
 def _train(nb_name, tmp_path, **params):
@@ -66,3 +86,35 @@ def test_max_epochs_and_explicit_amp(env, monkeypatch, nb_name):
 def test_no_gpu_still_runs(env, monkeypatch, nb_name):
     _fake_torch(monkeypatch, cuda=False)  # CPU: rfdetr trains 32-bit regardless of amp_dtype
     assert _train(nb_name, env)["amp_dtype"] == "fp16"
+
+
+@pytest.mark.parametrize("size,kind", [(None, "keypoint"), ("nano", "box"), ("small", "small"), ("medium", "medium")])
+def test_model_size_and_resolution(env, monkeypatch, size, kind):
+    _fake_torch(monkeypatch)
+    _train(BOX_NB, env, MODEL_SIZE=size, RESOLUTION=384)
+    assert FakeModel.calls[-1][0] == kind and BUILT[-1].kw == {"resolution": 384}
+    state = json.loads((env / "ckpt" / "run_state.json").read_text())
+    assert state["keypoint_mode"] is (size is None) and state["model_size"] == size and state["resolution"] == 384
+
+
+def test_defaults_build_keypoint_model_at_its_own_resolution(env, monkeypatch):
+    _fake_torch(monkeypatch)
+    _train(BOX_NB, env)
+    assert FakeModel.calls[-1][0] == "keypoint" and BUILT[-1].kw == {}
+
+
+def test_other_size_never_resumes(env, monkeypatch):
+    _fake_torch(monkeypatch)
+    _train(BOX_NB, env, MODEL_SIZE="small")
+    with zipfile.ZipFile(env / "ckpt" / "last.ckpt", "w") as z:  # a real (zip) checkpoint passes ckpt_ok
+        z.writestr("data.pkl", b"x")
+    kw = _train(BOX_NB, env, MODEL_SIZE="small")  # same choice: resumes
+    assert kw["resume"] == str(env / "ckpt" / "last.ckpt")
+    kw = _train(BOX_NB, env, MODEL_SIZE="medium")  # other size: fresh start
+    assert kw["resume"] is None and FakeModel.calls[-1][0] == "medium"
+
+
+def test_unknown_size_is_an_error(env, monkeypatch):
+    _fake_torch(monkeypatch)
+    with pytest.raises(ValueError, match="MODEL_SIZE"):
+        _train(BOX_NB, env, MODEL_SIZE="huge")

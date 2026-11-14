@@ -166,12 +166,13 @@ def usage_stats(rows: list[dict]) -> dict:
 
 @app.function(gpu=GPU, region=REGION, timeout=TIMEOUT_S, volumes={VOL: volume})
 def train(job_id: str, model_choice: str = "rfdetr", dataset_dir: str = "", num_workers: int = -1,
-          max_epochs: int = 0) -> dict:
+          max_epochs: int = 0, extra_params: dict | None = None) -> dict:
     """Runs the notebook for `model_choice` on job `job_id`. `dataset_dir` (Volume-relative,
     e.g. "datasets/x") replaces the job's own dataset/ folder. Returns {"onnx": Volume path
     of best.onnx, "summary": run_summary() + gpu, wall time, train image count, usage}.
     `num_workers` >= 0 sets the notebook's DataLoader workers (-1 = notebook default);
-    `max_epochs` > 0 caps the epochs (0 = notebook default, 200)."""
+    `max_epochs` > 0 caps the epochs (0 = notebook default, 200); `extra_params` = more notebook
+    parameters (e.g. {"MODEL_SIZE": "small", "RESOLUTION": 384})."""
     import subprocess
 
     import papermill as pm
@@ -194,6 +195,7 @@ def train(job_id: str, model_choice: str = "rfdetr", dataset_dir: str = "", num_
         params["NUM_WORKERS"] = num_workers
     if max_epochs > 0:
         params["MAX_EPOCHS"] = max_epochs
+    params.update(extra_params or {})
     sampler = UsageSampler().start()
     pm.execute_notebook(
         f"/notebooks/{NOTEBOOKS[model_choice]}", executed,
@@ -206,6 +208,7 @@ def train(job_id: str, model_choice: str = "rfdetr", dataset_dir: str = "", num_
     summary["cpu_request"] = os.environ.get("MODAL_CPU_REQUEST", "")
     summary["num_workers"] = num_workers
     summary["max_epochs"] = max_epochs
+    summary["extra_params"] = extra_params or {}
     summary["host_cpus"] = os.cpu_count()
     summary["gpu"] = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
                                     capture_output=True, text=True).stdout.strip()
@@ -253,28 +256,33 @@ def main(dataset: str, model: str = "rfdetr", job_id: str = "", out: str = "", g
 @app.local_entrypoint()
 def bench(out: str, datasets: str = "poe_mhb_20261103,goblins_20260914", models: str = "rfdetr,rfdetr_seg",
           gpus: str = "T4,L4,A10", tag: str = "", max_wait_h: float = 4.0, cpu_variants: str = "",
-          max_epochs: int = 0):
+          max_epochs: int = 0, param_sets: str = ""):
     """Timing runs for the price table: every dataset x model x GPU (one GPU type each, no
     fallback), all spawned at once (Starter = 10 GPUs; the rest queue). Datasets must already
     be on the Volume under datasets/<name>/. Results are written to `out` as they come in;
     calls still unfinished after `max_wait_h` are cancelled and recorded as such.
     `cpu_variants` = "default,8:6" -> per GPU one run with Modal's default CPU and one with
-    cpu=8 + NUM_WORKERS=6 ("<cores>:<workers>")."""
+    cpu=8 + NUM_WORKERS=6 ("<cores>:<workers>"). `param_sets` = JSON {"name": {notebook params}}:
+    one run per set (job id gets -<name>), e.g. '{"kp384": {"RESOLUTION": 384}, "nano": {"MODEL_SIZE": "nano"}}'."""
     tag = tag or time.strftime("%Y%m%d-%H%M")
+    sets = list(json.loads(param_sets).items()) if param_sets else [("", {})]
+    cpus = cpu_variants.split(",") if cpu_variants else ["default"]
     calls = []
     for ds in datasets.split(","):
         for m in models.split(","):
             for g in gpus.split(","):
-                for v in (cpu_variants.split(",") if cpu_variants else ["default"]):
-                    opts, workers, suffix = {"gpu": g}, -1, ""
-                    if v != "default":
-                        cores, workers = v.split(":")
-                        opts["cpu"], workers, suffix = float(cores), int(workers), f"-cpu{cores}w{workers}"
-                    job = f"bench-{tag}-{ds}-{m}-{g}{suffix}".lower()
-                    fc = train.with_options(**opts).spawn(job, m, f"datasets/{ds}", workers, max_epochs)
-                    calls.append(({"dataset": ds, "model": m, "gpu": g, "variant": v, "job_id": job,
-                                   "call_id": fc.object_id}, fc))
-                print(f"spawned {job} ({fc.object_id})")
+                for pname, extra in sets:
+                    for v in cpus:
+                        opts, workers, suffix = {"gpu": g}, -1, ""
+                        if v != "default":
+                            cores, workers = v.split(":")
+                            opts["cpu"], workers, suffix = float(cores), int(workers), f"-cpu{cores}w{workers}"
+                        suffix += f"-{pname}" if pname else ""
+                        job = f"bench-{tag}-{ds}-{m}-{g}{suffix}".lower()
+                        fc = train.with_options(**opts).spawn(job, m, f"datasets/{ds}", workers, max_epochs, extra)
+                        calls.append(({"dataset": ds, "model": m, "gpu": g, "variant": v, "params": pname,
+                                       "job_id": job, "call_id": fc.object_id}, fc))
+                        print(f"spawned {job} ({fc.object_id})")
     deadline = time.time() + max_wait_h * 3600
     results = []
     for meta, fc in calls:

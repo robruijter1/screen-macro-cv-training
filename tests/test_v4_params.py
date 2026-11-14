@@ -88,19 +88,38 @@ def test_no_gpu_still_runs(env, monkeypatch, nb_name):
     assert _train(nb_name, env)["amp_dtype"] == "fp16"
 
 
-@pytest.mark.parametrize("size,kind", [(None, "keypoint"), ("nano", "box"), ("small", "small"), ("medium", "medium")])
+@pytest.mark.parametrize("size,kind", [(None, "small"), ("keypoint", "keypoint"), ("nano", "box"),
+                                       ("small", "small"), ("medium", "medium")])
 def test_model_size_and_resolution(env, monkeypatch, size, kind):
     _fake_torch(monkeypatch)
     _train(BOX_NB, env, MODEL_SIZE=size, RESOLUTION=384)
     assert FakeModel.calls[-1][0] == kind and BUILT[-1].kw == {"resolution": 384}
     state = json.loads((env / "ckpt" / "run_state.json").read_text())
-    assert state["keypoint_mode"] is (size is None) and state["model_size"] == size and state["resolution"] == 384
+    assert state["keypoint_mode"] is (size == "keypoint") and state["model_size"] == (size or "small")
+    assert state["resolution"] == 384
 
 
-def test_defaults_build_keypoint_model_at_its_own_resolution(env, monkeypatch):
+def test_defaults_build_box_small_at_its_own_resolution(env, monkeypatch):
     _fake_torch(monkeypatch)
     _train(BOX_NB, env)
-    assert FakeModel.calls[-1][0] == "keypoint" and BUILT[-1].kw == {}
+    assert FakeModel.calls[-1][0] == "small" and BUILT[-1].kw == {}
+
+
+@pytest.mark.parametrize("nb_name", NOTEBOOKS)
+def test_labels_without_keypoint(env, monkeypatch, nb_name):
+    """v4: the app no longer asks for a click point; keypoint missing = box centre (box nb)."""
+    labels_path = env / "upload" / "labels.json"
+    data = json.loads(labels_path.read_text())
+    for e in data["labels"]:
+        for o in e["objects"]:
+            del o["keypoint"]
+    labels_path.write_text(json.dumps(data))
+    _fake_torch(monkeypatch)
+    _train(nb_name, env)
+    ann = json.loads((env / "dataset_coco" / "train" / "_annotations.coco.json").read_text())["annotations"]
+    if nb_name == BOX_NB:
+        assert all(a["keypoints"] == [15, 10, 2] for a in ann)  # box [5, 5, 20, 10] centre
+    assert ann
 
 
 def test_other_size_never_resumes(env, monkeypatch):

@@ -137,3 +137,12 @@ def test_unknown_size_is_an_error(env, monkeypatch):
     _fake_torch(monkeypatch)
     with pytest.raises(ValueError, match="MODEL_SIZE"):
         _train(BOX_NB, env, MODEL_SIZE="huge")
+
+
+@pytest.mark.parametrize("nb_name", NOTEBOOKS)
+@pytest.mark.parametrize("value,expected", [(None, "auto"), (4, 4), ("4", 4)])
+def test_batch_size_parameter(env, monkeypatch, nb_name, value, expected):
+    """v4: local Windows runs pass a fixed BATCH_SIZE (auto overfills 8 GB via shared memory)."""
+    _fake_torch(monkeypatch, native_bf16=True)
+    kw = _train(nb_name, env, BATCH_SIZE=value, MODEL_SIZE="small") if nb_name == BOX_NB else         _train(nb_name, env, BATCH_SIZE=value)
+    assert kw["batch_size"] == expected

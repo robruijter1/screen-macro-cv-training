@@ -34,9 +34,10 @@ NOTEBOOKS = {
     "rfdetr_seg": "train_object_detector_seg_v4.ipynb",
 }
 VOL = "/vol"
-# Fallback list: first type with capacity wins. Cheapest per unit of work first (2026-11-14 bench:
-# T4 costs 2-3x A10/L4 for box+kp). GBC_TRAIN_GPU="T4" (comma-separated) overrides; --gpu per call.
-GPU = os.environ.get("GBC_TRAIN_GPU", "A10,L4,T4").split(",")
+# Fallback list: first type with capacity wins. Cheapest per epoch first (2026-11-15 v4 bench, box Small
+# + seg: T4 < L4 < A10; seg on T4 ~2x the wall time of A10). GBC_TRAIN_GPU="T4" (comma-separated)
+# overrides; --gpu per call.
+GPU = os.environ.get("GBC_TRAIN_GPU", "T4,L4,A10").split(",")
 REGION = os.environ.get("GBC_TRAIN_REGION", "eu")  # all our services are EU; 1.15x price
 TIMEOUT_S = 6 * 3600  # Modal default is 5 min; max 24 h
 

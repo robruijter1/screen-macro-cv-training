@@ -53,7 +53,7 @@ image = (
 for _nb in NOTEBOOKS.values():
     image = image.add_local_file(HERE / _nb, f"/notebooks/{_nb}")
 
-app = modal.App("gbc-training", image=image)
+app = modal.App("gbc-training", image=image, tags={"purpose": "dev"})  # cost watch: never a prod cost
 volume = modal.Volume.from_name("gbc-training", create_if_missing=True)
 
 
